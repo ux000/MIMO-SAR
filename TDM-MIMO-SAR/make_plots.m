@@ -105,6 +105,7 @@ select=wave.time>=tau & wave.time<=8e-6;
 plot(wave.time(select)*1e6,real(wave.ifSignal(select)),'LineWidth',1.2); grid on;
 xlabel('快时间（微秒）'); ylabel('去斜信号实部（归一化）'); title(sprintf('发射乘接收共轭，拍频 %.3f 兆赫',wave.beatHz/1e6));
 finish(f,font,fullfile(fdir,'06_发射接收与混频.png'),cfg);
+plot_scene_geometry(cfg,out.geom);
 end
 
 function f=newfigure(name,cfg)
