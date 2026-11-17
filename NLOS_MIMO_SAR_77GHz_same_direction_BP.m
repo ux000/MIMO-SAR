@@ -202,8 +202,9 @@ grid on; xlabel('拍频（MHz）'); ylabel('归一化幅度（dB）');
 title('单通道去斜信号距离频谱');
 
 %% 7. 成像网格
-xGrid = 6.5:0.05:9.5;
-yGrid = 0.8:0.05:3.2;
+% 网格间隔取 2.5 cm，避免原 5 cm 网格过粗导致点扩散函数显示成块状
+xGrid = 6.5:0.025:9.5;
+yGrid = 0.8:0.025:3.2;
 [XX,YY] = meshgrid(xGrid,yGrid);
 [nY,nX] = size(XX);
 
@@ -221,7 +222,11 @@ end
 % 频率轴从负到正，便于线性插值
 fMin = fAxis(1);
 
-fprintf('正在执行传统 BP 与 NLOS-BP，请稍候...\n');
+% SAR 慢时间加 Hann 孔径加权，降低有限孔径旁瓣
+apWeight = 0.5-0.5*cos(2*pi*(0:Na-1)/(Na-1));
+apWeight = apWeight / max(apWeight);
+
+fprintf('正在执行直达模型失配成像与 NLOS-BP，请稍候...\n');
 
 %% 8. BP 成像
 for iy = 1:nY
@@ -310,8 +315,8 @@ for iy = 1:nY
                 % 与回波生成完全一致的去斜相位补偿
                 phaseCompN = exp(1j*2*pi*fc*tauN - 1j*pi*Kchirp*tauN.^2);
                 useN = validWall & validOcc;
-                sumN = sumN + sum(valN(useN).*phaseCompN(useN));
-                nValidN = nValidN + nnz(useN);
+                sumN = sumN + sum(valN(useN).*phaseCompN(useN).*apWeight(useN));
+                nValidN = nValidN + sum(apWeight(useN));
 
                 %% 8.2 传统直接路径 BP（但本场景直达路径被遮挡）
                 RtxD = sqrt((xP-xTx).^2+(yP-yRadar)^2);
@@ -324,8 +329,8 @@ for iy = 1:nY
                 % 传统 BP 故意使用“直达路径”时延去匹配实际 NLOS 回波，
                 % 用于展示传播模型失配造成的失焦。这里不屏蔽被遮挡的直达假设；
                 % 真实数据中并没有直达回波，只有墙面反射 NLOS 回波。
-                sumD = sumD + sum(valD.*phaseCompD);
-                nValidD = nValidD + Na;
+                sumD = sumD + sum(valD.*phaseCompD.*apWeight);
+                nValidD = nValidD + sum(apWeight);
             end
         end
 
@@ -342,19 +347,23 @@ for iy = 1:nY
 end
 
 %% 9. 归一化与显示
-imgN_dB = 20*log10(abs(imgNLOS)/max(abs(imgNLOS(:)))+1e-6);
-imgD_dB = 20*log10(abs(imgDirect)/max(abs(imgDirect(:)))+1e-6);
+% 关键修正：两幅图使用同一个参考幅度，禁止各自归一化到自己的最大值。
+% 传统直达模型图是“将 NLOS 回波错误地按直达路径匹配”的失配诊断图，
+% 不是一个真正含有直达回波的传统 SAR 成像结果。
+commonScale = max(abs(imgNLOS(:)));
+imgN_dB = 20*log10(abs(imgNLOS)/commonScale+1e-6);
+imgD_dB = 20*log10(abs(imgDirect)/commonScale+1e-6);
 
-figure('Color','w','Name','传统直接路径 BP');
+figure('Color','w','Name','直达路径模型失配诊断');
 imagesc(xGrid,yGrid,imgD_dB);
-axis xy equal tight; colorbar; caxis([-35 0]);
+axis xy equal tight; colorbar; caxis([-40 5]);
 hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r','MarkerSize',12);
 xlabel('x（m）'); ylabel('y（m）');
-title('传统直接路径 BP（场景直达路径被遮挡）');
+title('直达路径模型匹配 NLOS 回波（失配诊断，非真实直达成像）');
 
 figure('Color','w','Name','墙面反射 NLOS-BP');
 imagesc(xGrid,yGrid,imgN_dB);
-axis xy equal tight; colorbar; caxis([-35 0]);
+axis xy equal tight; colorbar; caxis([-40 0]);
 hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r','MarkerSize',12);
 xlabel('x（m）'); ylabel('y（m）');
 title('墙面反射 NLOS-BP 成像结果');
@@ -362,14 +371,16 @@ title('墙面反射 NLOS-BP 成像结果');
 figure('Color','w','Name','BP 对比');
 tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
 nexttile;
-imagesc(xGrid,yGrid,imgD_dB); axis xy equal tight; colorbar; caxis([-35 0]);
+imagesc(xGrid,yGrid,imgD_dB); axis xy equal tight; colorbar; caxis([-40 0]);
 hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r');
-xlabel('x（m）'); ylabel('y（m）'); title('传统直接路径 BP');
+xlabel('x（m）'); ylabel('y（m）');
+title('直达模型失配诊断');
 nexttile;
-imagesc(xGrid,yGrid,imgN_dB); axis xy equal tight; colorbar; caxis([-35 0]);
+imagesc(xGrid,yGrid,imgN_dB); axis xy equal tight; colorbar; caxis([-40 0]);
 hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r');
-xlabel('x（m）'); ylabel('y（m）'); title('墙面反射 NLOS-BP');
-sgtitle('同向 MIMO-SAR 非视域成像对比');
+xlabel('x（m）'); ylabel('y（m）');
+title('墙面反射 NLOS-BP');
+sgtitle('同向 MIMO-SAR 非视域成像对比（统一幅度标尺）');
 
 %% 10. 输出峰值定位误差
 [~,idxMax] = max(abs(imgNLOS(:)));
@@ -381,6 +392,9 @@ fprintf('\n========== 仿真结果 ==========\n');
 fprintf('真实目标位置：(%.3f, %.3f) m\n',targetXY(1),targetXY(2));
 fprintf('NLOS-BP 峰值位置：(%.3f, %.3f) m\n',peakXY(1),peakXY(2));
 fprintf('定位误差：%.4f m\n',locError);
+fprintf('NLOS-BP 峰值幅度（归一化前）：%.4e\n',abs(imgNLOS(iyMax,ixMax)));
+fprintf('直达模型失配峰值 / NLOS-BP 峰值：%.2f dB\n', ...
+    20*log10(max(abs(imgDirect(:))) / max(abs(imgNLOS(:))) + eps));
 fprintf('==============================\n');
 
 %% 11. 说明
