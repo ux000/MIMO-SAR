@@ -6,7 +6,7 @@
 %   2. 用 y=0 的有限反射墙构造 Tx->墙->隐藏目标->墙->Rx 双反射路径
 %   3. x=4 的不透明遮挡墙阻断直达路径，反射路径从其下方绕行
 %   4. 生成去斜后的 FMCW 多通道回波
-%   5. 比较传统直达路径 BP 与墙面模型 NLOS-BP
+%   5. 分别输出直达物理基准、直达模型失配诊断和墙面模型 NLOS-BP
 %
 % 重要建模说明：
 %   - 这是一个二维 x-y 平面、静止点目标、理想镜面反射的基准仿真。
@@ -183,6 +183,7 @@ sigPower = mean(abs(rxIF(:)).^2);
 noisePower = sigPower/10^(SNR_dB/10);
 noise = sqrt(noisePower/2)*(randn(size(rxIF),'single') + ...
                             1j*randn(size(rxIF),'single'));
+rxIF_noiseOnly = noise; % 当前仿真没有直达目标回波，保存纯噪声供直达基准使用
 rxIF = rxIF + noise;
 
 fprintf('回波生成完成。平均信号功率 %.3e，噪声功率 %.3e\n', ...
@@ -193,6 +194,7 @@ fprintf('回波生成完成。平均信号功率 %.3e，噪声功率 %.3e\n', ..
 win = single(0.5-0.5*cos(2*pi*(0:Ns-1)/Ns));
 win4 = reshape(win,[1 1 1 Ns]);
 rangeFFT = fftshift(fft(rxIF.*win4,Nfft,4),4)/sum(win);
+rangeFFTNoise = fftshift(fft(rxIF_noiseOnly.*win4,Nfft,4),4)/sum(win);
 
 % 选取一个代表通道显示拍频谱
 specShow = squeeze(abs(rangeFFT(ceil(NT/2),ceil(NR/2),ceil(Na/2),:)));
@@ -202,26 +204,34 @@ grid on; xlabel('拍频（MHz）'); ylabel('归一化幅度（dB）');
 title('单通道去斜信号距离频谱');
 
 %% 7. 成像网格
-xGrid = 6.5:0.05:9.5;
-yGrid = 0.8:0.05:3.2;
+% 网格间隔取 2.5 cm，避免原 5 cm 网格过粗导致点扩散函数显示成块状
+xGrid = 6.5:0.025:9.5;
+yGrid = 0.8:0.025:3.2;
 [XX,YY] = meshgrid(xGrid,yGrid);
 [nY,nX] = size(XX);
 
-imgNLOS = complex(zeros(nY,nX));
-imgDirect = complex(zeros(nY,nX));
+imgNLOS = complex(zeros(nY,nX));          % 正确 NLOS 路径成像
+imgDirect = complex(zeros(nY,nX));         % 纯噪声直达路径物理基准
+imgMismatch = complex(zeros(nY,nX));       % NLOS 回波按直达模型处理的失配诊断
 
 % 预先整理各通道的距离 FFT 数据，维度 Na x Nfft
 RD = cell(NT,NR);
+RDNoise = cell(NT,NR);
 for m = 1:NT
     for k = 1:NR
         RD{m,k} = squeeze(rangeFFT(m,k,:,:));
+        RDNoise{m,k} = squeeze(rangeFFTNoise(m,k,:,:));
     end
 end
 
 % 频率轴从负到正，便于线性插值
 fMin = fAxis(1);
 
-fprintf('正在执行传统 BP 与 NLOS-BP，请稍候...\n');
+% SAR 慢时间加 Hann 孔径加权，降低有限孔径旁瓣
+apWeight = 0.5-0.5*cos(2*pi*(0:Na-1)/(Na-1));
+apWeight = apWeight / max(apWeight);
+
+fprintf('正在执行直达模型失配成像与 NLOS-BP，请稍候...\n');
 
 %% 8. BP 成像
 for iy = 1:nY
@@ -231,8 +241,10 @@ for iy = 1:nY
 
         sumN = 0;
         sumD = 0;
+        sumMismatch = 0;
         nValidN = 0;
         nValidD = 0;
+        nValidMismatch = 0;
 
         for m = 1:NT
             for k = 1:NR
@@ -310,22 +322,39 @@ for iy = 1:nY
                 % 与回波生成完全一致的去斜相位补偿
                 phaseCompN = exp(1j*2*pi*fc*tauN - 1j*pi*Kchirp*tauN.^2);
                 useN = validWall & validOcc;
-                sumN = sumN + sum(valN(useN).*phaseCompN(useN));
-                nValidN = nValidN + nnz(useN);
+                sumN = sumN + sum(valN(useN).*phaseCompN(useN).*apWeight(useN));
+                nValidN = nValidN + sum(apWeight(useN));
 
-                %% 8.2 传统直接路径 BP（但本场景直达路径被遮挡）
+                %% 8.2 直达路径物理基准 + NLOS失配诊断（严格分开）
                 RtxD = sqrt((xP-xTx).^2+(yP-yRadar)^2);
                 RrxD = sqrt((xP-xRx).^2+(yP-yRadar)^2);
                 tauD = (RtxD+RrxD)/c;
                 fQueryD = -Kchirp*tauD;
-                valD = interp_range_fft(RD{m,k},fQueryD,fMin,df,Nfft);
-                phaseCompD = exp(1j*2*pi*fc*tauD - 1j*pi*Kchirp*tauD.^2);
+                phaseCompD = exp(1j*2*pi*fc*tauD ...
+                                 -1j*pi*Kchirp*tauD.^2);
 
-                % 传统 BP 故意使用“直达路径”时延去匹配实际 NLOS 回波，
-                % 用于展示传播模型失配造成的失焦。这里不屏蔽被遮挡的直达假设；
-                % 真实数据中并没有直达回波，只有墙面反射 NLOS 回波。
-                sumD = sumD + sum(valD.*phaseCompD);
-                nValidD = nValidD + Na;
+                % (A) 直达路径可见性：Tx->像素和像素->Rx均不能穿过遮挡墙
+                visibleTx = segment_clear_vertical_blocker( ...
+                    xTx,yRadar,xP,yP,xBlock,blockYMin,blockYMax);
+                visibleRx = segment_clear_vertical_blocker( ...
+                    xP,yP,xRx,yRadar,xBlock,blockYMin,blockYMax);
+                useD = visibleTx & visibleRx;
+
+                % 当前场景只生成 NLOS 目标回波，没有直达目标回波。
+                % 因此物理直达基准必须使用纯噪声数据。
+                valD_noise = interp_range_fft( ...
+                    RDNoise{m,k},fQueryD,fMin,df,Nfft);
+                sumD = sumD + sum(valD_noise(useD).* ...
+                                  phaseCompD(useD).*apWeight(useD));
+                nValidD = nValidD + sum(apWeight(useD));
+
+                % (B) 独立的失配诊断：将含 NLOS 回波的数据按直达模型处理，
+                % 不加可见性掩膜，仅用于显示错误传播模型造成的伪影。
+                valMismatch = interp_range_fft( ...
+                    RD{m,k},fQueryD,fMin,df,Nfft);
+                sumMismatch = sumMismatch + sum( ...
+                    valMismatch.*phaseCompD.*apWeight);
+                nValidMismatch = nValidMismatch + sum(apWeight);
             end
         end
 
@@ -334,6 +363,11 @@ for iy = 1:nY
         end
         if nValidD>0
             imgDirect(iy,ix)=sumD/nValidD;
+        else
+            imgDirect(iy,ix)=0; % 所有直达观测均被遮挡
+        end
+        if nValidMismatch>0
+            imgMismatch(iy,ix)=sumMismatch/nValidMismatch;
         end
     end
     if mod(iy,5)==0
@@ -342,34 +376,62 @@ for iy = 1:nY
 end
 
 %% 9. 归一化与显示
-imgN_dB = 20*log10(abs(imgNLOS)/max(abs(imgNLOS(:)))+1e-6);
-imgD_dB = 20*log10(abs(imgDirect)/max(abs(imgDirect(:)))+1e-6);
+% 统一以 NLOS-BP 峰值作为参考，避免每幅图单独归一化造成误导。
+commonScale = max(abs(imgNLOS(:))) + eps;
+imgN_dB = 20*log10(abs(imgNLOS)/commonScale+1e-6);
+imgD_dB = 20*log10(abs(imgDirect)/commonScale+1e-6);
+imgMismatch_dB = 20*log10(abs(imgMismatch)/commonScale+1e-6);
 
-figure('Color','w','Name','传统直接路径 BP');
+% 图A：物理直达路径基准。当前仿真无直达目标回波，因此使用纯噪声数据。
+figure('Color','w','Name','直达路径物理基准（纯噪声）');
 imagesc(xGrid,yGrid,imgD_dB);
-axis xy equal tight; colorbar; caxis([-35 0]);
-hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r','MarkerSize',12);
+axis xy equal tight; colorbar; caxis([-60 0]);
+hold on; plot(targetXY(1),targetXY(2),'rp', ...
+    'MarkerFaceColor','r','MarkerSize',12);
 xlabel('x（m）'); ylabel('y（m）');
-title('传统直接路径 BP（场景直达路径被遮挡）');
+title('直达路径基准：纯噪声数据 + 直达可见性掩膜');
 
+% 图B：失配诊断。NLOS回波按直达路径延迟/相位处理，不施加可见性掩膜。
+figure('Color','w','Name','直达模型失配诊断');
+imagesc(xGrid,yGrid,imgMismatch_dB);
+axis xy equal tight; colorbar; caxis([-40 0]);
+hold on; plot(targetXY(1),targetXY(2),'rp', ...
+    'MarkerFaceColor','r','MarkerSize',12);
+xlabel('x（m）'); ylabel('y（m）');
+title('NLOS回波按直达模型处理（失配伪影，非真实直达成像）');
+
+% 图C：正确的墙面反射 NLOS-BP
 figure('Color','w','Name','墙面反射 NLOS-BP');
 imagesc(xGrid,yGrid,imgN_dB);
-axis xy equal tight; colorbar; caxis([-35 0]);
-hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r','MarkerSize',12);
+axis xy equal tight; colorbar; caxis([-40 0]);
+hold on; plot(targetXY(1),targetXY(2),'rp', ...
+    'MarkerFaceColor','r','MarkerSize',12);
 xlabel('x（m）'); ylabel('y（m）');
 title('墙面反射 NLOS-BP 成像结果');
 
-figure('Color','w','Name','BP 对比');
-tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+% 图D：三种结果并列，统一幅度参考
+figure('Color','w','Name','三种处理结果对比');
+tiledlayout(1,3,'Padding','compact','TileSpacing','compact');
+
 nexttile;
-imagesc(xGrid,yGrid,imgD_dB); axis xy equal tight; colorbar; caxis([-35 0]);
+imagesc(xGrid,yGrid,imgD_dB); axis xy equal tight; colorbar; caxis([-60 0]);
 hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r');
-xlabel('x（m）'); ylabel('y（m）'); title('传统直接路径 BP');
+xlabel('x（m）'); ylabel('y（m）');
+title('直达基准（纯噪声）');
+
 nexttile;
-imagesc(xGrid,yGrid,imgN_dB); axis xy equal tight; colorbar; caxis([-35 0]);
+imagesc(xGrid,yGrid,imgMismatch_dB); axis xy equal tight; colorbar; caxis([-40 0]);
 hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r');
-xlabel('x（m）'); ylabel('y（m）'); title('墙面反射 NLOS-BP');
-sgtitle('同向 MIMO-SAR 非视域成像对比');
+xlabel('x（m）'); ylabel('y（m）');
+title('直达模型失配诊断');
+
+nexttile;
+imagesc(xGrid,yGrid,imgN_dB); axis xy equal tight; colorbar; caxis([-40 0]);
+hold on; plot(targetXY(1),targetXY(2),'rp','MarkerFaceColor','r');
+xlabel('x（m）'); ylabel('y（m）');
+title('NLOS-BP');
+
+sgtitle('同向 MIMO-SAR 非视域成像：直达基准、失配诊断与 NLOS-BP');
 
 %% 10. 输出峰值定位误差
 [~,idxMax] = max(abs(imgNLOS(:)));
@@ -381,14 +443,54 @@ fprintf('\n========== 仿真结果 ==========\n');
 fprintf('真实目标位置：(%.3f, %.3f) m\n',targetXY(1),targetXY(2));
 fprintf('NLOS-BP 峰值位置：(%.3f, %.3f) m\n',peakXY(1),peakXY(2));
 fprintf('定位误差：%.4f m\n',locError);
+fprintf('NLOS-BP 峰值幅度（归一化前）：%.4e\n',abs(imgNLOS(iyMax,ixMax)));
+fprintf('直达物理基准峰值 / NLOS-BP 峰值：%.2f dB\n', ...
+    20*log10(max(abs(imgDirect(:))) / (max(abs(imgNLOS(:)))+eps) + eps));
+fprintf('直达模型失配峰值 / NLOS-BP 峰值：%.2f dB\n', ...
+    20*log10(max(abs(imgMismatch(:))) / (max(abs(imgNLOS(:)))+eps) + eps));
 fprintf('==============================\n');
 
 %% 11. 说明
-disp('仿真完成。');
+disp('仿真完成：直达物理基准使用纯噪声数据；失配诊断单独使用 NLOS 回波。');
 disp('注意：本程序是理想二维镜面反射基准模型，不包含墙面粗糙散射、');
 disp('多径杂波、目标运动、天线方向图、互耦和TDM时序误差。');
 
 %% ======================== 局部函数 =========================
+
+function isClear = segment_clear_vertical_blocker(x1,y1,x2,y2,xWall,yMin,yMax)
+% 判断二维线段 (x1,y1)->(x2,y2) 是否穿过有限竖直遮挡墙：
+%   x=xWall, y in [yMin,yMax]。
+% 输入坐标可以是标量或等长向量，输出为对应逻辑行向量。
+    x1 = x1(:).'; y1 = y1(:).';
+    x2 = x2(:).'; y2 = y2(:).';
+
+    n = max([numel(x1),numel(y1),numel(x2),numel(y2)]);
+    if ~(numel(x1)==1 || numel(x1)==n) || ...
+       ~(numel(y1)==1 || numel(y1)==n) || ...
+       ~(numel(x2)==1 || numel(x2)==n) || ...
+       ~(numel(y2)==1 || numel(y2)==n)
+        error('遮挡判断函数的输入必须为标量或相同长度的向量。');
+    end
+
+    if isscalar(x1), x1 = repmat(x1,1,n); end
+    if isscalar(y1), y1 = repmat(y1,1,n); end
+    if isscalar(x2), x2 = repmat(x2,1,n); end
+    if isscalar(y2), y2 = repmat(y2,1,n); end
+
+    dx = x2-x1;
+    crossesX = (xWall >= min(x1,x2)) & (xWall <= max(x1,x2));
+    yCross = nan(1,n);
+    nz = abs(dx)>eps;
+    yCross(nz) = y1(nz)+(y2(nz)-y1(nz)).*(xWall-x1(nz))./dx(nz);
+
+    % 若线段与遮挡墙所在 x 坐标共线，且 y 范围有重叠，也视为遮挡
+    collinear = ~nz & abs(x1-xWall)<=eps & ...
+        max(min(y1,y2),yMin)<=min(max(y1,y2),yMax);
+
+    blocked = (crossesX & nz & yCross>=yMin & yCross<=yMax) | collinear;
+    isClear = ~blocked;
+end
+
 function yq = interp_range_fft(RDmat,fQuery,fMin,df,Nfft)
 % 对每个慢时间位置，在距离 FFT 频率轴上进行复数线性插值。
 % RDmat: Na x Nfft；fQuery: 1 x Na 或 Na x 1
